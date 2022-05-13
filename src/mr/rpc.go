@@ -24,6 +24,20 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type AskTask struct {
+	WorkID int
+}
+
+// worker请求master后，获得的reply信息
+type Task struct {
+	// mr-X-Y
+	Nmap int // X
+	// 如果是map任务，则返回要分片的文件名
+	Filename string
+	WorkID   int
+	// 定值
+	NReduce int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

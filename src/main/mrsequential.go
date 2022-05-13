@@ -37,6 +37,8 @@ func main() {
 	//
 	intermediate := []mr.KeyValue{}
 	for _, filename := range os.Args[2:] {
+		// 所有的pg-*文件数组
+		// fmt.Println("ms", filename)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -50,12 +52,15 @@ func main() {
 		intermediate = append(intermediate, kva...)
 	}
 
+	// fmt.Println("intermediate: ", intermediate)
+
 	//
 	// a big difference from real MapReduce is that all the
 	// intermediate data is in one place, intermediate[],
 	// rather than being partitioned into NxM buckets.
 	//
 
+	// 在这排序了
 	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-0"
@@ -76,7 +81,9 @@ func main() {
 			values = append(values, intermediate[k].Value)
 		}
 		output := reducef(intermediate[i].Key, values)
-
+		//if i == 0 {
+		//	fmt.Println("output", output, intermediate[i].Key)
+		//}
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 

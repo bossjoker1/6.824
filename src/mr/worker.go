@@ -1,10 +1,18 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
+var (
+	cnt int64 = 0
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -12,6 +20,15 @@ import "hash/fnv"
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+// 任务结构
+type Work struct {
+	state    int //状态
+	wtype    int // 0对应map, 1对应reduce
+	id       int
+	filename string
+	mx       sync.Mutex
 }
 
 //
@@ -24,7 +41,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,6 +48,27 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+
+	for {
+
+		go func() {
+			// worker请求任务
+			ask := AskTask{WorkID: int(cnt)}
+
+			atomic.AddInt64(&cnt, 1)
+			// fmt.Println("cnt: ", cnt)
+			task := Task{}
+			ok := call("Coordinator.AssignTask", &ask, &task)
+
+			if ok {
+				fmt.Println("get a task successfully!", task)
+			} else {
+				fmt.Println("call failed!!!")
+			}
+
+		}()
+		time.Sleep(time.Second)
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
