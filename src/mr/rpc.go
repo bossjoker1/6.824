@@ -6,7 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"os"
+	"sync"
+)
 import "strconv"
 
 //
@@ -31,12 +34,30 @@ type AskTask struct {
 // worker请求master后，获得的reply信息
 type Task struct {
 	// mr-X-Y
-	Nmap int // X
+	// Nmap int // X
 	// 如果是map任务，则返回要分片的文件名
 	Filename string
-	WorkID   int
+	// 如果是reduce任务，返回中间文件名集合
+	Fs     []string
+	WorkID int
 	// 定值
 	NReduce int
+	// job type
+	JType int
+	MX    sync.Mutex
+}
+
+// 中间文件请求
+type InterArgs struct {
+	WorkId int
+	Fs     []string
+}
+
+type ReduceDoneArgs struct {
+	WorkId int
+}
+
+type NoReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

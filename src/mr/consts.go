@@ -7,6 +7,7 @@ import "time"
 const (
 	MAPTYPE    = 0
 	REDUCETYPE = 1
+	EMPTY      = 2
 )
 
 // worker state
