@@ -1,155 +1,118 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
-
-var (
-	lock       = sync.Mutex{}
-	reduceChan = make(chan ReduceTask, 10)
-)
-
-type WorkInfo struct {
-	WorkID int
-	State  int
-	WType  int
-}
-
-type ReduceTask struct {
-	WorkId int
-	Fs     []string
-}
 
 type Coordinator struct {
 	// Your definitions here.
-	files       []string // 要处理的文件名集合
-	nReduce     int
-	done        bool
-	workerCnt   int
-	mapInfos    []WorkInfo
-	reduceInfos []WorkInfo
-	mx          sync.Mutex
-	hmx         sync.Mutex
-	taskChans   chan Task
-	// 维护中间文件
-	interFiles map[int][]string
-	mapDone    int
-	reduceDone int
-}
+	files          []string // 要处理的文件名集合
+	filesize       int
+	allocMap       []bool
+	mapTime        []int64
+	finishedMap    []bool
+	finishedMapCnt int
 
-func (c *Coordinator) MakeMapTask(filename string) Task {
-	return Task{
-		WorkID:   -1,
-		NReduce:  c.nReduce,
-		Filename: filename,
-		JType:    MAPTYPE,
-	}
-}
+	nReduce           int
+	allocReduce       []bool
+	reduceTime        []int64
+	finishedReduce    []bool
+	finishedReduceCnt int
 
-// master Schedule
-func (c *Coordinator) InitSchedule() {
-	for _, fname := range c.files {
-
-		c.taskChans <- c.MakeMapTask(fname)
-
-	}
+	finishedMutex sync.RWMutex
+	mx            sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) AssignTask(args *AskTask, reply *Task) error {
-	id := args.WorkID
+func (c *Coordinator) AssignMap(args *AskMapTaskArgs, reply *MapReply) error {
+	// 第二次请求，正常情况下已完成
+	if args.FileId != -1 {
+		if !c.finishedMap[args.FileId] {
+			c.finishedMap[args.FileId] = true
+			c.finishedMutex.Lock()
+			c.finishedMapCnt++
+			c.finishedMutex.Unlock()
+		}
 
-	if id >= len(c.files) {
-		// fmt.Println(" ")
-		//log.Fatal("idx excels the file array limit!")
-		//return fmt.Errorf("idx excels the file array limit!")
+		c.finishedMutex.RLock()
+		if c.finishedMapCnt == c.filesize {
+			c.finishedMutex.RUnlock()
+			reply.MapFinish = true // map task结束
+			reply.FileId = -1
+			return nil
+		}
+		c.finishedMutex.RUnlock()
 	}
 
+	// 第一次请求，返回map的文件名
+	// 或者由于crash原因造成任务失败(超过10s还未完成)
 	c.mx.Lock()
-
-	select {
-	case task := <-c.taskChans:
-		if task.WorkID != -1 {
-			id = task.WorkID
-		}
-		// 更新master记录的worker信息
-		c.mapInfos[id].State = RUNNING
-		c.mapInfos[id].WorkID = id
-		c.mapInfos[id].WType = MAPTYPE
-		c.workerCnt++
-		// 构造回复
-		task.WorkID = id
-		reply.NReduce = task.NReduce
-		reply.WorkID = task.WorkID
-		reply.Filename = task.Filename
-		reply.JType = task.JType
-
-	case task := <-reduceChan:
-		c.reduceInfos[task.WorkId].State = RUNNING
-		c.reduceInfos[task.WorkId].WorkID = task.WorkId
-		c.reduceInfos[task.WorkId].WType = REDUCETYPE
-		c.workerCnt++
-		reply.WorkID = task.WorkId
-		reply.Fs = task.Fs
-		reply.JType = REDUCETYPE
-
-	default:
-		reply.JType = EMPTY
-		fmt.Println("waiting for...")
-	}
-	c.mx.Unlock()
-	return nil
-}
-
-func (c *Coordinator) MapFinishedToReduce(args *InterArgs, reply *NoReply) error {
-	// fmt.Println("to generate reduce files", args)
-	for _, v := range args.Fs {
-		var mid, rid int
-		fmt.Sscanf(v, "mr-%d-%d", &mid, &rid)
-		// 是否有重复元素
-		isRepeat := false
-		c.mx.Lock()
-		for _, f := range c.interFiles[rid] {
-			if v == f {
-				isRepeat = true
-			}
-		}
-		if isRepeat {
+	for i := 0; i < c.filesize; i++ {
+		if !c.allocMap[i] || (!c.finishedMap[i] && time.Now().Unix()-c.mapTime[i] > 10) {
+			c.allocMap[i] = true
+			c.mapTime[i] = time.Now().Unix()
 			c.mx.Unlock()
-			continue
-		}
 
-		c.interFiles[rid] = append(c.interFiles[rid], v)
-		c.mx.Unlock()
-	}
-
-	c.mx.Lock()
-	c.mapDone++
-	c.mapInfos[args.WorkId].State = FINISHED
-	// map工作已经完成
-	if c.mapDone == len(c.files) {
-		for k, v := range c.interFiles {
-			reduceChan <- ReduceTask{
-				WorkId: k,
-				Fs:     v,
-			}
+			reply.MapFinish = false
+			reply.Filename = c.files[i]
+			reply.NReduce = c.nReduce
+			reply.FileId = i
+			return nil
 		}
 	}
+
 	c.mx.Unlock()
+	// 都已经分配完
+	c.finishedMutex.RLock()
+	reply.MapFinish = c.finishedMapCnt == c.filesize
+	c.finishedMutex.RUnlock()
+	reply.FileId = -1
+
 	return nil
 }
 
-func (c *Coordinator) FinishedReduce(args *ReduceDoneArgs, reply *NoReply) error {
+func (c *Coordinator) AssignReduce(args *AskReduceArgs, reply *ReduceReply) error {
+	if args.ReduceId != -1 {
+		if !c.finishedReduce[args.ReduceId] {
+			c.finishedReduce[args.ReduceId] = true
+			c.finishedMutex.Lock()
+			c.finishedReduceCnt++
+			c.finishedMutex.Unlock()
+		}
+		c.finishedMutex.RLock()
+		if c.finishedReduceCnt == c.nReduce {
+			c.finishedMutex.RUnlock()
+			reply.Reduced = true
+			reply.ReduceId = -1
+			return nil
+		}
+		c.finishedMutex.RUnlock()
+	}
+
 	c.mx.Lock()
-	c.reduceInfos[args.WorkId].State = FINISHED
-	c.reduceDone++
+	for i := 0; i < c.nReduce; i++ {
+		if !c.allocReduce[i] || (!c.finishedReduce[i] && time.Now().Unix()-c.reduceTime[i] > 10) {
+			c.allocReduce[i] = true
+			c.reduceTime[i] = time.Now().Unix()
+			c.mx.Unlock()
+			reply.Reduced = false
+			reply.ReduceId = i
+			reply.FileSize = c.filesize
+			return nil
+		}
+	}
+
 	c.mx.Unlock()
+	c.finishedMutex.RLock()
+	reply.Reduced = c.finishedReduceCnt == c.nReduce
+	c.finishedMutex.RUnlock()
+	reply.ReduceId = -1
 	return nil
 }
 
@@ -187,8 +150,10 @@ func (c *Coordinator) Done() bool {
 	// ret := false
 
 	// Your code here.
-
-	return len(c.files) == c.mapDone && c.reduceDone == c.nReduce
+	c.finishedMutex.RLock()
+	ret := c.finishedReduceCnt == c.nReduce
+	c.finishedMutex.RUnlock()
+	return ret
 }
 
 //
@@ -197,25 +162,24 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	l := len(files)
+	c := Coordinator{
+		files:          files,
+		nReduce:        nReduce,
+		filesize:       l,
+		allocMap:       make([]bool, l),
+		mapTime:        make([]int64, l),
+		finishedMap:    make([]bool, l),
+		finishedMapCnt: 0,
+
+		allocReduce:       make([]bool, nReduce),
+		reduceTime:        make([]int64, nReduce),
+		finishedReduce:    make([]bool, nReduce),
+		finishedReduceCnt: 0,
+	}
 
 	// Your code here.
-	c.mx = sync.Mutex{}
-	c.hmx = sync.Mutex{}
-	c.files = files
-	if len(files) < nReduce {
-		c.taskChans = make(chan Task, len(files))
-	} else {
-		c.taskChans = make(chan Task, nReduce)
-	}
-	c.interFiles = make(map[int][]string)
-	c.nReduce = nReduce
-	c.workerCnt = 0
-	c.mapDone = 0
-	c.reduceDone = 0
-	c.mapInfos = make([]WorkInfo, MAXNUM)
-	c.reduceInfos = make([]WorkInfo, nReduce)
-	c.InitSchedule()
+
 	c.server()
 	return &c
 }

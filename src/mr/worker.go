@@ -9,8 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"sync"
-	"sync/atomic"
+	"strconv"
 	"time"
 )
 
@@ -33,15 +32,6 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-// 任务结构
-type Work struct {
-	state    int //状态
-	wtype    int // 0对应map, 1对应reduce
-	id       int
-	filename string
-	mx       sync.Mutex
-}
-
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -59,146 +49,92 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	filename := ""
+	fileId, nReduce := -1, 0
+	mapFinished := false
 
-	for {
+	for !mapFinished {
+		filename, fileId, nReduce, mapFinished = CallAskMap(fileId)
+		// 已经分配完或者map tasks已经结束
+		if fileId == -1 {
+			time.Sleep(time.Second)
+			continue
+		}
 
-		go func() {
-			// worker请求任务
-			ask := AskTask{WorkID: int(cnt)}
-			atomic.AddInt64(&cnt, 1)
-			// fmt.Println("cnt: ", cnt)
-			task := Task{}
-			ok := call("Coordinator.AssignTask", &ask, &task)
+		content, err := ioutil.ReadFile(filename)
+		if err != nil {
+			panic("readfile " + filename + "failed!\n")
+		}
 
-			if ok {
-				fmt.Println("get a task successfully!", task)
+		kva := mapf(filename, string(content))
+		var file *os.File
+		jsonMap := map[string]*json.Encoder{}
+		for _, v := range kva {
+			hash := ihash(v.Key) % nReduce
+			InterFileName := fmt.Sprintf("mr-%d-%d", fileId, hash)
+			enc, ok := jsonMap[InterFileName]
+			if !ok {
+				file, err = os.OpenFile(InterFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+				if err != nil {
+					panic("cannot create file " + InterFileName + "\n")
+				}
+				enc = json.NewEncoder(file)
+				jsonMap[InterFileName] = enc
+			}
+			err := enc.Encode(&v)
+			if err != nil {
+				panic("json encode failed!\n")
+			}
+		}
+		file.Close()
+	}
 
-				// 开启心跳检测
-			} else {
-				fmt.Println("call failed!!!")
-				log.Fatal("worker call coordinator failed.\n")
+	reduceId := -1
+	reduced := false
+	fileSize := 0
+
+	for !reduced {
+		reduceId, reduced, fileSize = CallAskReduce(reduceId)
+		// fmt.Println("reduce : ", reduceId)
+		if reduceId == -1 {
+			time.Sleep(time.Second)
+			continue
+		}
+		intermediate := getKVSlice(reduceId, fileSize)
+
+		if len(intermediate) == 0 {
+			continue
+		}
+		sort.Sort(ByKey(intermediate))
+
+		filename := "mr-out-" + strconv.Itoa(reduceId)
+		file, err := ioutil.TempFile("", filename+"-")
+		if err != nil {
+			panic("create temp file " + file.Name() + "failed : " + err.Error() + "\n")
+		}
+
+		i := 0
+		for i < len(intermediate) {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
 			}
 
-			if task.JType == MAPTYPE {
-				// 读取并处理文本文件
-				filename := task.Filename
-				file, err := os.Open(filename)
-				if err != nil {
-					log.Fatalf("cannot open %v", filename)
-				}
-				fmt.Println("file : ", file.Name())
-				content, err := ioutil.ReadAll(file)
-				// fmt.Println("content : ", content, err)
-				if err != nil {
-					log.Fatalf("cannot read %v", filename)
-				}
-				err = file.Close()
-				if err != nil {
-					return
-				}
-				kva := mapf(filename, string(content))
+			var output string
+			output = reducef(intermediate[i].Key, values)
+			fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
+			i = j
+		}
 
-				files := []string{}
-				jsonMap := map[string]*json.Encoder{}
-				// fmt.Println("kva: ", kva)
-				for _, v := range kva {
-					hash := ihash(v.Key) % task.NReduce
-					InterFileName := fmt.Sprintf("mr-%d-%d", task.WorkID, hash)
-					enc, ok := jsonMap[InterFileName]
-					if !ok {
-						file, err := os.OpenFile(InterFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-						if err != nil {
-							log.Fatalf("cannot create file %s", InterFileName)
-						}
-						enc = json.NewEncoder(file)
-						jsonMap[InterFileName] = enc
-					}
-					err := enc.Encode(&v)
-					if err != nil {
-						fmt.Println("here!!!!!!")
-						log.Fatal(err)
-					}
-
-					files = append(files, InterFileName)
-				}
-				// fmt.Println("one map task finished : ", task.WorkID, files)
-				// map任务完成
-				call("Coordinator.MapFinishedToReduce", &InterArgs{
-					WorkId: task.WorkID,
-					Fs:     files,
-				}, &NoReply{})
-			} else if task.JType == REDUCETYPE {
-				// reduce task
-				if len(task.Fs) > 0 {
-					intermediate := getKVSlice(task.Fs)
-					sort.Sort(ByKey(intermediate))
-
-					_, err := os.Stat(fmt.Sprintf("mr-out-%d", task.WorkID))
-
-					if os.IsNotExist(err) {
-						file, err := ioutil.TempFile("", "mr-temp-")
-						if err != nil {
-							log.Fatalf("cannot create temp file")
-						}
-
-						//
-						// call Reduce on each distinct key in intermediate[],
-						// and print the result to mr-out-0.
-						//
-						i := 0
-						for i < len(intermediate) {
-							j := i + 1
-							for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-								j++
-							}
-							values := []string{}
-							for k := i; k < j; k++ {
-								values = append(values, intermediate[k].Value)
-							}
-
-							var output string
-
-							output = reducef(intermediate[i].Key, values)
-							//if i == 0 {
-							//	fmt.Println("output", output, intermediate[i].Key)
-							//}
-
-							if len(output) == 0 {
-								err = file.Close()
-								if err != nil {
-									log.Fatalln("[error]:", err)
-								}
-								err := os.Remove(file.Name())
-								if err != nil {
-									return
-								}
-								log.Println("time out, worker crashed!")
-								continue
-							}
-
-							// this is the correct format for each line of Reduce output.
-							_, err := fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
-							if err != nil {
-								log.Fatal("[error]:", err)
-							}
-							i = j
-						}
-
-						err = file.Close()
-						if err != nil {
-							log.Fatalln("[error]:", err)
-						}
-						err = os.Rename(file.Name(), fmt.Sprintf("mr-out-%d", task.WorkID))
-						if err != nil {
-							log.Fatalf("rename file failed  %v ", err)
-						}
-					}
-				}
-
-				log.Println("reduceTask Done")
-				call("Coordinator.FinishedReduce", &ReduceDoneArgs{WorkId: task.WorkID}, &NoReply{})
-			}
-		}()
+		file.Close()
+		err = os.Rename(file.Name(), filename)
+		if err != nil {
+			panic("rename " + file.Name() + " to " + filename + " failed!\n")
+		}
 
 		time.Sleep(time.Second)
 	}
@@ -208,11 +144,37 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
-func getKVSlice(fs []string) (kva []KeyValue) {
-	for _, v := range fs {
-		f, err := os.Open(v)
+func CallAskMap(fileId int) (string, int, int, bool) {
+	reply := MapReply{}
+	ok := call("Coordinator.AssignMap", &AskMapTaskArgs{
+		FileId: fileId,
+	}, &reply)
+	if ok {
+		return reply.Filename, reply.FileId, reply.NReduce, reply.MapFinish
+	} else {
+		panic("ask map task failed!\n")
+	}
+}
+
+func CallAskReduce(reduceId int) (int, bool, int) {
+	reply := ReduceReply{}
+	ok := call("Coordinator.AssignReduce", &AskReduceArgs{
+		ReduceId: reduceId,
+	}, &reply)
+	if ok {
+		return reply.ReduceId, reply.Reduced, reply.FileSize
+	} else {
+		panic("ask reduce task failed!\n")
+	}
+}
+
+func getKVSlice(reduceId int, fileSize int) (kva []KeyValue) {
+	// fmt.Println("get kv slice")
+	for i := 0; i < fileSize; i++ {
+		filename := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reduceId)
+		f, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("open file %s failed!", v)
+			continue
 		}
 
 		dec := json.NewDecoder(f)
@@ -275,6 +237,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	// fmt.Println(err)
 	return false
 }

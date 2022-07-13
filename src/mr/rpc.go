@@ -17,6 +17,27 @@ import "strconv"
 // and reply for an RPC.
 //
 
+type AskMapTaskArgs struct {
+	FileId int
+}
+
+type MapReply struct {
+	Filename  string
+	FileId    int
+	NReduce   int
+	MapFinish bool
+}
+
+type AskReduceArgs struct {
+	ReduceId int
+}
+
+type ReduceReply struct {
+	ReduceId int
+	Reduced  bool
+	FileSize int
+}
+
 type ExampleArgs struct {
 	X int
 }
